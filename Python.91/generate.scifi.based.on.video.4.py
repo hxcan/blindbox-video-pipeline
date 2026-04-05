@@ -1,0 +1,210 @@
+import os
+import sys
+import base64
+import requests
+import subprocess
+import dashscope
+import random
+from datetime import datetime
+from dashscope.audio.tts import SpeechSynthesizer
+from dashscope import MultiModalConversation
+import json
+
+
+# 构造提示词（更新为基于视频）
+def construct_prompt(app_name):
+    return f"以下是这个应用的名字，不要自己猜测应用的名字。结合这段视频内容，写一篇科幻小说，不超过140字。开头要给一个吸睛的标题，但是不要用书名号将标题包起来。末尾包含热门的#号标签，标签数量不超过2, 标签尽可能跟当前这个应用的功能实际相关，并且是常用标签，不用自造标签。如果需要主角的话，女主角就以小美作为主角，一个漂亮的中国女人，男主角就以丧彪作为主角。避免出现markdown标记，我目前只需要纯文字的内容。避免将政治相关的东西写入小说中。\n{app_name}"
+
+
+# 发送请求生成短科幻小说（使用视频）
+def send_request(video_path, prompt, api_key):
+    file_url = f"file://{os.path.abspath(video_path)}"
+    messages = [
+        {
+            'role': 'user',
+            'content': [
+                {'video': file_url, 'fps': 1, 'max_frames': 20},
+                {'text': prompt}
+            ]
+        }
+    ]
+
+    print(f"📌 正在调用 MultiModalConversation...")
+    print(f"📁 视频路径: {file_url}")
+    print(f"📝 提示词: {prompt}")
+
+    try:
+        response = MultiModalConversation.call(
+            api_key=api_key,
+            model='qwen-vl-max-latest',
+            messages=messages
+        )
+
+        print(f"📨 响应状态: {response.status_code}")
+        if response.status_code != 200:
+            print(f"❌ 错误代码: {response.code}, 消息: {response.message}")
+            return None
+
+        # 👁️ 调试输出 raw 结构
+        print("🔍 Raw Response Output:")
+        print(json.dumps(response.output, ensure_ascii=False, indent=2))
+
+        output = response.output
+        choices = output.get("choices", [])
+        if not choices:
+            print("❌ AI 返回结果为空")
+            return None
+
+        message = choices[0].get("message", {})
+        content = message.get("content", "")
+
+        print(f"📄 内容类型: {type(content)}, 内容: {content}")
+
+        # ✅ 安全处理 content
+        if isinstance(content, str):
+            return {"choices": [{"message": {"content": content}}]}
+        elif isinstance(content, list):
+            text = ''.join([item['text'] for item in content if isinstance(item, dict) and 'text' in item])
+            return {"choices": [{"message": {"content": text}}]}
+        else:
+            print(f"⚠️ 未知 content 格式: {type(content)}")
+            return None
+
+    except Exception as e:
+        import traceback
+        print(f"❌ 请求异常: {e}")
+        print(f"📋 Traceback:\n{traceback.format_exc()}")
+        return None
+
+
+# 使用Sambert语音合成
+def tts_request(text, api_key):
+    dashscope.api_key = api_key
+    result = SpeechSynthesizer.call(
+        model='sambert-zhiting-v1',
+        text=text,
+        sample_rate=16000
+    )
+    if result.get_audio_data() is not None:
+        output_file_path = './generated_story.wav'
+        with open(output_file_path, 'wb') as f:
+            f.write(result.get_audio_data())
+        print(f'SUCCESS: get audio data in {output_file_path}')
+        return output_file_path
+    else:
+        print('ERROR: response is %s' % (result.get_response()))
+        return None
+
+
+# 保存小说到带时间戳的文本文件
+def save_story_to_file(text):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f'generated_story_{timestamp}.txt'
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(text)
+    print(f"SUCCESS: 小说已保存至 {filename}")
+
+
+# 加载人脸模板列表
+def load_face_templates():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    assets_dir = os.path.join(script_dir, '..', 'Material', 'assets')
+    json_path = os.path.join(assets_dir, 'face_templates.json')
+
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(f"❌ 未找到人脸模板配置文件: {json_path}")
+
+    with open(json_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    return [item['filename'] for item in data['faces']]
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Usage: script.py <video.mp4> <app_name>")
+        sys.exit(1)
+
+    video_path = sys.argv[1]
+    app_name = sys.argv[2]
+    # 从环境变量读取 API Key（推荐方式）
+    api_key = os.environ.get("DASHSCOPE_API_KEY")
+    
+    if not api_key:
+        print("❌ 错误：未找到 DASHSCOPE_API_KEY 环境变量")
+        print("💡 请设置环境变量后运行:")
+        print("   export DASHSCOPE_API_KEY='your-api-key-here'")
+        print("或者在 ~/.bashrc 或 ~/.zshrc 中添加:")
+        print("   export DASHSCOPE_API_KEY='your-api-key-here'")
+        sys.exit(1)
+
+        sys.exit(1)
+
+    prompt = construct_prompt(app_name)
+    result = send_request(video_path, prompt, api_key)
+
+    if result and 'choices' in result and len(result['choices']) > 0:
+        generated_text = result['choices'][0]['message']['content']
+        generated_text = generated_text + ' '
+        print("Generated Sci-fi Story:")
+        print(generated_text)
+
+        # 保存小说到文本文件（带时间戳）
+        save_story_to_file(generated_text)
+
+        # === 新增：读取 output_info.json 获取 title，并生成 description ===
+        output_info_path = 'output_info.json'
+
+        try:
+            with open(output_info_path, 'r', encoding='utf-8') as f:
+                output_info = json.load(f)
+            video_title = output_info.get("title", "").strip()
+            if not video_title:
+                print("Warning: 'title' is missing or empty in output_info.json")
+                video_title = "Untitled"
+        except FileNotFoundError:
+            print(f"Error: {output_info_path} not found. Please run video.fps.60.rb first.")
+            sys.exit(1)
+        except json.JSONDecodeError as e:
+            print(f"Error: Failed to parse {output_info_path}: {e}")
+            sys.exit(1)
+
+        # 拼接 description
+        description = f"{video_title} {generated_text}".strip()
+
+        # 输出到终端（便于手动复制到各平台）
+        print("\n=== Final Description (Copy for platforms) ===")
+        print(description)
+        print("==============================================\n")
+
+        # 写回 output_info.json，追加 description 字段
+        output_info["description"] = description
+        try:
+            with open(output_info_path, 'w', encoding='utf-8') as f:
+                json.dump(output_info, f, ensure_ascii=False, indent=4)
+            print(f"SUCCESS: Description 已追加到 {output_info_path}")
+        except Exception as e:
+            print(f"Error writing to {output_info_path}: {e}")
+
+        # === 原有逻辑继续：TTS 和调用 Ruby 脚本 ===
+        output_file = tts_request(generated_text, api_key)
+        if output_file:
+            print(f"语音文件已保存至: {output_file}")
+
+            current_script_path = os.path.abspath(__file__)
+            script_dir = os.path.dirname(current_script_path)
+
+            second_script_path = os.path.join(script_dir, '..', 'ruby.he', 'generate.face.video.p4.rb')
+
+            # ✅ 加载外部模板列表
+            candidate_images = load_face_templates()
+
+            selected_image = random.choice(candidate_images)
+            video_template_path = os.path.join(script_dir, '..', 'material.ache', 'image.e', selected_image)
+
+            second_script_path = os.path.abspath(second_script_path)
+            video_template_path = os.path.abspath(video_template_path)
+
+            subprocess.call(['ruby', second_script_path, output_file, video_template_path])
+    else:
+        print("Failed to generate story.")
