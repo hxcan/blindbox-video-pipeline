@@ -11,27 +11,35 @@ from dashscope import MultiModalConversation
 import json
 
 
-# 构造提示词（更新为基于视频）
-def construct_prompt(app_name):
-    return f"以下是这个应用的名字，不要自己猜测应用的名字。结合这段视频内容，写一篇科幻小说，不超过140字。开头要给一个吸睛的标题，但是不要用书名号将标题包起来。末尾包含热门的#号标签，标签数量不超过2, 标签尽可能跟当前这个应用的功能实际相关，并且是常用标签，不用自造标签。如果需要主角的话，女主角就以小美作为主角，一个漂亮的中国女人，男主角就以丧彪作为主角。避免出现markdown标记，我目前只需要纯文字的内容。避免将政治相关的东西写入小说中。\n{app_name}"
+# 构造提示词（支持视频或截屏图片）
+def construct_prompt(app_name, media_type="视频"):
+    if media_type == "视频":
+        return f"以下是这个应用的名字，不要自己猜测应用的名字。结合这段视频内容，写一篇科幻小说，不超过 140 字。开头要给一个吸睛的标题，但是不要用书名号将标题包起来。末尾包含热门的#号标签，标签数量不超过 2, 标签尽可能跟当前这个应用的功能实际相关，并且是常用标签，不用自造标签。如果需要主角的话，女主角就以小美作为主角，一个漂亮的中国女人，男主角就以丧彪作为主角。避免出现 markdown 标记，我目前只需要纯文字的内容。避免将政治相关的东西写入小说中。\n{app_name}"
+    else:  # 截屏图片
+        return f"以下是这个应用的名字，不要自己猜测应用的名字。结合这张截屏图片内容，写一篇科幻小说，不超过 140 字。开头要给一个吸睛的标题，但是不要用书名号将标题包起来。末尾包含热门的#号标签，标签数量不超过 2, 标签尽可能跟当前这个应用的功能实际相关，并且是常用标签，不用自造标签。如果需要主角的话，女主角就以小美作为主角，一个漂亮的中国女人，男主角就以丧彪作为主角。避免出现 markdown 标记，我目前只需要纯文字的内容。避免将政治相关的东西写入小说中。\n{app_name}"
 
 
-# 发送请求生成短科幻小说（使用视频）
-def send_request(video_path, prompt, api_key):
-    file_url = f"file://{os.path.abspath(video_path)}"
+# 发送请求生成短科幻小说（支持视频或截屏图片）
+def send_request(media_path, prompt, api_key, media_type="video"):
+    file_url = f"file://{os.path.abspath(media_path)}"
+    
+    if media_type == "video":
+        content_list = [{'video': file_url, 'fps': 1, 'max_frames': 20}, {'text': prompt}]
+        print(f"📌 正在调用 MultiModalConversation (视频模式)...")
+        print(f"📁 视频路径：{file_url}")
+    else:  # image
+        content_list = [{'image': file_url}, {'text': prompt}]
+        print(f"📌 正在调用 MultiModalConversation (截屏图片模式)...")
+        print(f"🖼️ 图片路径：{file_url}")
+    
     messages = [
         {
             'role': 'user',
-            'content': [
-                {'video': file_url, 'fps': 1, 'max_frames': 20},
-                {'text': prompt}
-            ]
+            'content': content_list
         }
     ]
 
-    print(f"📌 正在调用 MultiModalConversation...")
-    print(f"📁 视频路径: {file_url}")
-    print(f"📝 提示词: {prompt}")
+    print(f"📝 提示词：{prompt}")
 
     try:
         response = MultiModalConversation.call(
@@ -40,9 +48,13 @@ def send_request(video_path, prompt, api_key):
             messages=messages
         )
 
-        print(f"📨 响应状态: {response.status_code}")
+        print(f"📨 响应状态：{response.status_code}")
         if response.status_code != 200:
-            print(f"❌ 错误代码: {response.code}, 消息: {response.message}")
+            print(f"❌ 错误代码：{response.code}, 消息：{response.message}")
+            # 检查是否是 DataInspectionFailed 错误
+            if response.code == "DataInspectionFailed" or "DataInspectionFailed" in str(response.message):
+                print("⚠️ 检测到 DataInspectionFailed 错误，视频内容可能包含不当元素")
+                return {"error": "DataInspectionFailed"}
             return None
 
         # 👁️ 调试输出 raw 结构
@@ -58,7 +70,7 @@ def send_request(video_path, prompt, api_key):
         message = choices[0].get("message", {})
         content = message.get("content", "")
 
-        print(f"📄 内容类型: {type(content)}, 内容: {content}")
+        print(f"📄 内容类型：{type(content)}, 内容：{content}")
 
         # ✅ 安全处理 content
         if isinstance(content, str):
@@ -67,17 +79,17 @@ def send_request(video_path, prompt, api_key):
             text = ''.join([item['text'] for item in content if isinstance(item, dict) and 'text' in item])
             return {"choices": [{"message": {"content": text}}]}
         else:
-            print(f"⚠️ 未知 content 格式: {type(content)}")
+            print(f"⚠️ 未知 content 格式：{type(content)}")
             return None
 
     except Exception as e:
         import traceback
-        print(f"❌ 请求异常: {e}")
+        print(f"❌ 请求异常：{e}")
         print(f"📋 Traceback:\n{traceback.format_exc()}")
         return None
 
 
-# 使用Sambert语音合成
+# 使用 Sambert 语音合成
 def tts_request(text, api_key):
     dashscope.api_key = api_key
     result = SpeechSynthesizer.call(
@@ -112,7 +124,7 @@ def load_face_templates():
     json_path = os.path.join(assets_dir, 'face_templates.json')
 
     if not os.path.exists(json_path):
-        raise FileNotFoundError(f"❌ 未找到人脸模板配置文件: {json_path}")
+        raise FileNotFoundError(f"❌ 未找到人脸模板配置文件：{json_path}")
 
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -138,11 +150,47 @@ if __name__ == "__main__":
         print("   export DASHSCOPE_API_KEY='your-api-key-here'")
         sys.exit(1)
 
+    # 第一次尝试：使用视频生成小说
+    prompt = construct_prompt(app_name, media_type="视频")
+    result = send_request(video_path, prompt, api_key, media_type="video")
+    
+    # 检查是否需要回退到截屏图片方式
+    use_screenshot = False
+    if result and isinstance(result, dict) and result.get("error") == "DataInspectionFailed":
+        print("\n🔄 检测到 DataInspectionFailed 错误，尝试回退到截屏图片方式...")
+        
+        # 从当前工作目录的 output_info.json 读取截屏图片路径
+        output_info_path = os.path.join(os.getcwd(), "output_info.json")
+        screenshot_path = None
+        
+        if os.path.exists(output_info_path):
+            try:
+                with open(output_info_path, 'r', encoding='utf-8') as f:
+                    output_info = json.load(f)
+                screenshot_path = output_info.get("cover_image")
+                
+                if screenshot_path and os.path.exists(screenshot_path):
+                    print(f"✅ 找到截屏图片：{screenshot_path}")
+                    use_screenshot = True
+                else:
+                    print("⚠️ output_info.json 中未找到有效的 cover_image 路径")
+            except Exception as e:
+                print(f"⚠️ 读取 output_info.json 失败：{e}")
+        else:
+            print(f"⚠️ output_info.json 不存在：{output_info_path}")
+        
+        if use_screenshot:
+            # 使用截屏图片重新生成小说
+            prompt = construct_prompt(app_name, media_type="截屏图片")
+            result = send_request(screenshot_path, prompt, api_key, media_type="image")
+        else:
+            print("❌ 无法回退到截屏图片方式，生成失败")
+            sys.exit(1)
+
+    if result and isinstance(result, dict) and result.get("error") == "DataInspectionFailed":
+        print("❌ 截屏图片方式也失败，无法生成小说")
         sys.exit(1)
-
-    prompt = construct_prompt(app_name)
-    result = send_request(video_path, prompt, api_key)
-
+    
     if result and 'choices' in result and len(result['choices']) > 0:
         generated_text = result['choices'][0]['message']['content']
         generated_text = generated_text + ' '
@@ -189,7 +237,7 @@ if __name__ == "__main__":
         # === 原有逻辑继续：TTS 和调用 Ruby 脚本 ===
         output_file = tts_request(generated_text, api_key)
         if output_file:
-            print(f"语音文件已保存至: {output_file}")
+            print(f"语音文件已保存至：{output_file}")
 
             current_script_path = os.path.abspath(__file__)
             script_dir = os.path.dirname(current_script_path)
