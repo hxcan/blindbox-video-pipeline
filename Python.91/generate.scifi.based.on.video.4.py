@@ -20,7 +20,7 @@ def get_video_duration(video_path):
     """获取视频时长（秒）"""
     try:
         result = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', 
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
             '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
             capture_output=True, text=True, timeout=30
         )
@@ -314,7 +314,7 @@ if __name__ == "__main__":
         if use_screenshot:
             # 使用截屏图片重新生成小说
             prompt = construct_prompt(app_name, media_type="截屏图片")
-            result = send_request(screenshot_path, prompt, api_key, media_type="Image")
+            result = send_request(screenshot_path, prompt, api_key, media_type="image")
         else:
             print("❌ 无法回退到截屏图片方式，生成失败")
             sys.exit(1)
