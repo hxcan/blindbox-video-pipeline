@@ -40,12 +40,13 @@ def get_video_size(video_path):
         return 0
 
 
-def trim_video_to_half_duration(input_path, output_path):
-    """裁切视频到一半时长
+def trim_video_to_half_duration(input_path, output_path, target_duration=None):
+    """裁切视频到指定时长
     
     Args:
         input_path: 输入视频路径
         output_path: 输出临时视频路径
+        target_duration: 目标时长（秒），如果不指定则裁切到一半
         
     Returns:
         bool: 是否成功
@@ -55,15 +56,17 @@ def trim_video_to_half_duration(input_path, output_path):
     if duration is None:
         return False
     
-    # 计算一半时长
-    half_duration = duration / 2
-    print(f"📐 视频总时长：{duration:.2f}秒，裁切到：{half_duration:.2f}秒")
+    # 计算目标时长
+    if target_duration is None:
+        target_duration = duration / 2
     
-    # 使用ffmpeg裁切前一半
+    print(f"📐 视频总时长：{duration:.2f}秒，裁切到：{target_duration:.2f}秒")
+    
+    # 使用ffmpeg裁切
     try:
         cmd = [
             'ffmpeg', '-y', '-i', input_path,
-            '-t', str(half_duration),
+            '-t', str(target_duration),
             '-c', 'copy',  # 直接复制，不重新编码，速度快
             output_path
         ]
@@ -92,7 +95,7 @@ def trim_video_to_half_duration(input_path, output_path):
 
 
 def check_and_trim_video(video_path):
-    """检查视频大小，必要时裁切
+    """检查视频大小，必要时循环裁切直到符合阈值
     
     Args:
         video_path: 原始视频路径
@@ -114,18 +117,58 @@ def check_and_trim_video(video_path):
     
     print(f"⚠️ 文件过大（>{MAX_FILE_SIZE_MIB} MiB），需要裁切...")
     
-    # 生成临时文件路径
-    base, ext = os.path.splitext(video_path)
-    temp_path = f"{base}.trimmed{ext}"
-    
-    # 执行裁切
-    if trim_video_to_half_duration(video_path, temp_path):
-        temp_size = get_video_size(temp_path)
-        temp_size_mib = temp_size / (1024 * 1024)
-        print(f"✅ 裁切后文件大小：{temp_size_mib:.2f} MiB")
-        return temp_path, True, True
-    else:
+    # 获取原始视频时长
+    original_duration = get_video_duration(video_path)
+    if original_duration is None:
         return None, True, False
+    
+    # 循环裁切：每次减半，直到文件大小符合要求
+    current_input = video_path
+    current_duration = original_duration
+    iteration = 0
+    max_iterations = 10  # 最多循环10次，防止无限循环
+    
+    while current_duration > 1.0:  # 时长至少保留1秒
+        iteration += 1
+        if iteration > max_iterations:
+            print(f"⚠️ 已达最大裁切次数（{max_iterations}），停止裁切")
+            break
+        
+        print(f"\n🔄 第 {iteration} 次裁切尝试...")
+        
+        # 生成临时文件路径
+        base, ext = os.path.splitext(video_path)
+        if iteration == 1:
+            temp_path = f"{base}.trimmed{ext}"
+        else:
+            # 覆盖之前的临时文件
+            temp_path = f"{base}.trimmed{ext}"
+        
+        # 目标时长减半
+        target_duration = current_duration / 2
+        print(f"📐 当前时长 {current_duration:.2f}秒，裁切到 {target_duration:.2f}秒...")
+        
+        # 执行裁切
+        if not trim_video_to_half_duration(current_input, temp_path, target_duration):
+            return None, True, False
+        
+        # 检查裁切后的文件大小
+        new_size = get_video_size(temp_path)
+        new_size_mib = new_size / (1024 * 1024)
+        print(f"📁 裁切后文件大小：{new_size_mib:.2f} MiB")
+        
+        if new_size <= MAX_FILE_SIZE_BYTES:
+            print(f"✅ 文件大小符合要求（≤{MAX_FILE_SIZE_MIB} MiB）")
+            return temp_path, True, True
+        
+        # 文件仍然过大，继续裁切
+        print(f"⚠️ 文件仍然过大，继续裁切...")
+        current_input = temp_path
+        current_duration = target_duration
+    
+    # 时长太短无法继续裁切
+    print(f"⚠️ 时长已降至 {current_duration:.2f}秒，无法继续裁切")
+    return temp_path if os.path.exists(temp_path) else None, True, False
 
 
 def cleanup_temp_file(temp_path):
