@@ -61,7 +61,6 @@ def trim_video_to_half_duration(input_path, output_path, target_duration=None):
         target_duration = duration / 2
     
     print(f"📐 视频总时长：{duration:.2f}秒，裁切到：{target_duration:.2f}秒")
-    
     # 使用ffmpeg裁切
     try:
         cmd = [
@@ -116,17 +115,20 @@ def check_and_trim_video(video_path):
         return video_path, False, True
     
     print(f"⚠️ 文件过大（>{MAX_FILE_SIZE_MIB} MiB），需要裁切...")
-    
     # 获取原始视频时长
     original_duration = get_video_duration(video_path)
     if original_duration is None:
         return None, True, False
+    
+    # 生成基础临时文件名
+    base, ext = os.path.splitext(video_path)
     
     # 循环裁切：每次减半，直到文件大小符合要求
     current_input = video_path
     current_duration = original_duration
     iteration = 0
     max_iterations = 10  # 最多循环10次，防止无限循环
+    last_successful_output = None
     
     while current_duration > 1.0:  # 时长至少保留1秒
         iteration += 1
@@ -135,14 +137,8 @@ def check_and_trim_video(video_path):
             break
         
         print(f"\n🔄 第 {iteration} 次裁切尝试...")
-        
-        # 生成临时文件路径
-        base, ext = os.path.splitext(video_path)
-        if iteration == 1:
-            temp_path = f"{base}.trimmed{ext}"
-        else:
-            # 覆盖之前的临时文件
-            temp_path = f"{base}.trimmed{ext}"
+        # 生成唯一的临时文件路径
+        temp_path = f"{base}.trimmed.{iteration}{ext}"
         
         # 目标时长减半
         target_duration = current_duration / 2
@@ -150,6 +146,10 @@ def check_and_trim_video(video_path):
         
         # 执行裁切
         if not trim_video_to_half_duration(current_input, temp_path, target_duration):
+            # 如果失败，返回上一次成功的临时文件（如果有的话）
+            if last_successful_output:
+                print(f"⚠️ 裁切失败，使用上一次成功的文件：{last_successful_output}")
+                return last_successful_output, True, True
             return None, True, False
         
         # 检查裁切后的文件大小
@@ -163,12 +163,16 @@ def check_and_trim_video(video_path):
         
         # 文件仍然过大，继续裁切
         print(f"⚠️ 文件仍然过大，继续裁切...")
+        last_successful_output = temp_path
         current_input = temp_path
         current_duration = target_duration
     
     # 时长太短无法继续裁切
     print(f"⚠️ 时长已降至 {current_duration:.2f}秒，无法继续裁切")
-    return temp_path if os.path.exists(temp_path) else None, True, False
+    if last_successful_output:
+        print(f"📹 使用最后一次成功的文件：{last_successful_output}")
+        return last_successful_output, True, True
+    return None, True, False
 
 
 def cleanup_temp_file(temp_path):
