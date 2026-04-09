@@ -11,8 +11,8 @@ from dashscope import MultiModalConversation
 import json
 
 
-# 文件大小阈值：338.4 MiB
-MAX_FILE_SIZE_MIB = 338.4
+# 文件大小阈值：138.4 MiB
+MAX_FILE_SIZE_MIB = 138.4
 MAX_FILE_SIZE_BYTES = int(MAX_FILE_SIZE_MIB * 1024 * 1024)
 
 
