@@ -15,7 +15,6 @@ import json
 MAX_FILE_SIZE_MIB = 138.4
 MAX_FILE_SIZE_BYTES = int(MAX_FILE_SIZE_MIB * 1024 * 1024)
 
-
 def get_video_duration(video_path):
     """获取视频时长（秒）"""
     try:
@@ -38,7 +37,6 @@ def get_video_size(video_path):
     except Exception as e:
         print(f"⚠️ 获取视频大小失败：{e}")
         return 0
-
 
 def trim_video_to_half_duration(input_path, output_path, target_duration=None):
     """裁切视频到指定时长
@@ -91,7 +89,6 @@ def trim_video_to_half_duration(input_path, output_path, target_duration=None):
     except Exception as e:
         print(f"❌ 裁切异常：{e}")
         return False
-
 
 def check_and_trim_video(video_path):
     """检查视频大小，必要时循环裁切直到符合阈值
@@ -220,6 +217,22 @@ def send_request(media_path, prompt, api_key, media_type="video"):
             messages=messages
         )
         print(f"📨 响应状态：{response.status_code}")
+        
+        # 🆕 新增：检测 HTTP 500 错误并返回特殊标记
+        if response.status_code == 500:
+            error_msg = ""
+            # 尝试获取错误信息
+            if hasattr(response, 'code'):
+                error_msg = f"server_error, {response.code}"
+            elif hasattr(response, 'message'):
+                error_msg = str(response.message)
+            else:
+                error_msg = "unknown server error"
+            
+            print(f"❌ HTTP 500 错误：{error_msg}")
+            # 返回特殊错误标记，触发降级逻辑
+            return {"error": "HTTP_500", "message": error_msg, "status_code": 500}
+        
         if response.status_code != 200:
             print(f"❌ 错误代码：{response.code}, 消息：{response.message}")
             # 检查是否是 DataInspectionFailed 错误
@@ -333,11 +346,19 @@ if __name__ == "__main__":
         cleanup_temp_file(processed_video_path)
     # === 新增结束 ===
     
-    # 检查是否需要回退到截屏图片方式
+    # 🆕 新增：检测 HTTP 500 错误，触发降级
     use_screenshot = False
+    if result and isinstance(result, dict) and result.get("error") == "HTTP_500":
+        http_500_msg = result.get("message", "unknown error")
+        print(f"\n🔄 检测到 HTTP 500 错误（{http_500_msg}），尝试回退到截屏图片方式...")
+        use_screenshot = True
+    
+    # 检查是否需要回退到截屏图片方式
     if result and isinstance(result, dict) and result.get("error") == "DataInspectionFailed":
         print("\n🔄 检测到 DataInspectionFailed 错误，尝试回退到截屏图片方式...")
-        
+        use_screenshot = True
+    
+    if use_screenshot:
         # 从当前工作目录的 output_info.json 读取截屏图片路径
         output_info_path = os.path.join(os.getcwd(), "output_info.json")
         screenshot_path = None
@@ -350,7 +371,6 @@ if __name__ == "__main__":
                 
                 if screenshot_path and os.path.exists(screenshot_path):
                     print(f"✅ 找到截屏图片：{screenshot_path}")
-                    use_screenshot = True
                 else:
                     print("⚠️ output_info.json 中未找到有效的 cover_image 路径")
             except Exception as e:
@@ -358,7 +378,7 @@ if __name__ == "__main__":
         else:
             print(f"⚠️ output_info.json 不存在：{output_info_path}")
         
-        if use_screenshot:
+        if screenshot_path and os.path.exists(screenshot_path):
             # 使用截屏图片重新生成小说
             prompt = construct_prompt(app_name, media_type="截屏图片")
             result = send_request(screenshot_path, prompt, api_key, media_type="image")
@@ -366,7 +386,7 @@ if __name__ == "__main__":
             print("❌ 无法回退到截屏图片方式，生成失败")
             sys.exit(1)
     
-    if result and isinstance(result, dict) and result.get("error") == "DataInspectionFailed":
+    if result and isinstance(result, dict) and result.get("error") in ["HTTP_500", "DataInspectionFailed"]:
         print("❌ 截屏图片方式也失败，无法生成小说")
         sys.exit(1)
     
