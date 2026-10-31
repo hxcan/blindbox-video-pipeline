@@ -508,18 +508,30 @@ def load_tts_credentials():
 
 
 def _tts_request_v1(text, cred):
-    """Old SDK path: dashscope.audio.tts.SpeechSynthesizer (sambert-*)."""
+    """Old SDK path: dashscope.audio.tts.SpeechSynthesizer (sambert-*).
+
+    sambert models go over the websocket endpoint. The workspace dedicated
+    domain does not serve the sambert websocket protocol, so use the standard
+    endpoint when the configured base_url points at a workspace domain.
+    """
     dashscope.api_key = cred["api_key"]
     kwargs = {
         "model": cred["model"],
         "text": text,
         "sample_rate": cred["sample_rate"],
     }
+    # sambert voice: usually implied by the model name, but pass it when set
+    if cred.get("voice"):
+        kwargs["voice"] = cred["voice"]
     # base_address overrides the websocket endpoint for this call only
-    if cred.get("base_url"):
-        kwargs["base_address"] = cred["base_url"]
+    base_url = cred.get("base_url") or ""
+    if base_url:
+        if "maas.aliyuncs.com" in base_url:
+            # workspace dedicated domain has no sambert websocket route
+            base_url = TTS_DEFAULT_BASE_URL
+        kwargs["base_address"] = base_url
     # timeout guards against a dead key hanging the whole failover chain
-    kwargs.setdefault("timeout", cred.get("timeout") or TTS_HTTP_TIMEOUT)
+    kwargs.setdefault("timeout", cred.get("timeout") or TTS_SDK_TIMEOUT)
     result = SpeechSynthesizer.call(**kwargs)
     audio = result.get_audio_data()
     if audio is not None:
