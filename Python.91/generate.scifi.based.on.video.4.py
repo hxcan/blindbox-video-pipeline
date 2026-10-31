@@ -8,6 +8,7 @@ import random
 from datetime import datetime
 from dashscope.audio.tts import SpeechSynthesizer
 import json
+import signal
 
 
 # 文件大小阈值：14 MiB（确保 Base64 编码后 < 20MB，以适配百炼 API 限制）
@@ -348,6 +349,11 @@ TTS_DEFAULT_MODEL_V1 = "sambert-zhiting-v1"
 TTS_DEFAULT_MODEL_V2 = "qwen-tts"
 TTS_DEFAULT_VOICE_V2 = "longxiaochun"
 TTS_DEFAULT_SAMPLE_RATE = 16000
+TTS_DEFAULT_HTTP_BASE_URL = "https://dashscope.aliyuncs.com"
+TTS_DEFAULT_MODEL_HTTP = "qwen3-tts-flash"
+TTS_HTTP_TIMEOUT = 300
+TTS_SDK_TIMEOUT = 120
+TTS_DEFAULT_LANGUAGE = "Chinese"
 
 # --- optional import of the v2 (new generation) speech synthesizer ---
 try:
@@ -379,21 +385,28 @@ def _normalize_tts_entry(entry):
     if not api_key:
         return None
 
+    # base_url first: the sdk auto-detection below depends on it
+    base_url = (entry.get("base_url") or entry.get("url") or "").strip()
     model = (entry.get("model") or "").strip()
+
     sdk = (entry.get("sdk") or "").strip().lower()
     if not sdk:
         low = model.lower()
-        if low.startswith("qwen-tts") or "cosyvoice" in low:
+        if "maas.aliyuncs.com" in base_url.lower():
+            # workspace dedicated domain -> DashScope HTTP generation endpoint
+            sdk = "http"
+        elif low.startswith("qwen3-tts") or low.startswith("qwen-tts") \
+                or "cosyvoice" in low:
             sdk = "v2"
         else:
             sdk = "v1"
 
-    base_url = (entry.get("base_url") or entry.get("url") or "").strip()
     if not base_url:
-        base_url = TTS_DEFAULT_BASE_URL
+        base_url = TTS_DEFAULT_HTTP_BASE_URL if sdk == "http" \
+            else TTS_DEFAULT_BASE_URL
 
     voice = (entry.get("voice") or "").strip()
-    if not voice and sdk == "v2":
+    if not voice and sdk in ("v2", "http"):
         voice = TTS_DEFAULT_VOICE_V2
 
     try:
@@ -402,7 +415,12 @@ def _normalize_tts_entry(entry):
         sample_rate = TTS_DEFAULT_SAMPLE_RATE
 
     if not model:
-        model = TTS_DEFAULT_MODEL_V2 if sdk == "v2" else TTS_DEFAULT_MODEL_V1
+        if sdk == "http":
+            model = TTS_DEFAULT_MODEL_HTTP
+        elif sdk == "v2":
+            model = TTS_DEFAULT_MODEL_V2
+        else:
+            model = TTS_DEFAULT_MODEL_V1
 
     return {
         "api_key": api_key,
@@ -411,10 +429,11 @@ def _normalize_tts_entry(entry):
         "voice": voice,
         "sample_rate": sample_rate,
         "sdk": sdk,
+        "language_type": (entry.get("language_type") or "").strip()
+                         or TTS_DEFAULT_LANGUAGE,
+        "timeout": entry.get("timeout"),
         "note": (entry.get("note") or "").strip() or "config file",
     }
-
-
 def load_tts_credentials():
     """
     Load TTS credentials from ~/.blindbox/aliyun.nces/tts.art.json.
@@ -499,6 +518,8 @@ def _tts_request_v1(text, cred):
     # base_address overrides the websocket endpoint for this call only
     if cred.get("base_url"):
         kwargs["base_address"] = cred["base_url"]
+    # timeout guards against a dead key hanging the whole failover chain
+    kwargs.setdefault("timeout", cred.get("timeout") or TTS_HTTP_TIMEOUT)
     result = SpeechSynthesizer.call(**kwargs)
     audio = result.get_audio_data()
     if audio is not None:
@@ -524,6 +545,95 @@ def _tts_request_v2(text, cred):
     return audio
 
 
+def _tts_request_http(text, cred):
+    """
+    Workspace HTTP path (qwen3-tts-flash and friends).
+
+    Endpoint: {base_url}/api/v1/services/aigc/multimodal-generation/generation
+    Request : {"model": ..., "input": {"text": ..., "voice": ..., "language_type": ...}}
+    Response: output.audio.url  (full wav url, valid 24h) or output.audio.data (base64)
+
+    base_url may be given either as the workspace host
+    (https://ws-xxx.cn-beijing.maas.aliyuncs.com) or with the /api/v1 suffix
+    already appended; both are handled.
+    """
+    base = (cred.get("base_url") or TTS_DEFAULT_HTTP_BASE_URL).strip().rstrip("/")
+    # the config may carry the workspace host, or a full OpenAI-compatible base
+    # url; only the host part is needed for the DashScope generation endpoint
+    for suffix in ("/compatible-mode/v1", "/api/v1"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    url = base + "/api/v1/services/aigc/multimodal-generation/generation"
+
+    payload = {
+        "model": cred["model"],
+        "input": {
+            "text": text,
+            "voice": cred["voice"],
+            "language_type": cred.get("language_type") or "Chinese",
+        },
+    }
+    headers = {
+        "Authorization": "Bearer " + cred["api_key"],
+        "Content-Type": "application/json",
+    }
+    resp = requests.post(url, json=payload, headers=headers,
+                         timeout=cred.get("timeout") or TTS_HTTP_TIMEOUT)
+    if resp.status_code != 200:
+        raise RuntimeError("HTTP %s: %s" % (resp.status_code, resp.text[:200]))
+    data = resp.json()
+    audio = (data.get("output") or {}).get("audio") or {}
+    # inline base64 audio (some endpoints return it directly)
+    inline = audio.get("data")
+    if inline:
+        import base64 as _b64
+        try:
+            return _b64.b64decode(inline)
+        except Exception:
+            pass
+    # otherwise download from the OSS url
+    audio_url = audio.get("url")
+    if not audio_url:
+        raise RuntimeError("no audio in response: %s" % resp.text[:200])
+    print(f"   downloading audio: {audio_url[:90]}...")
+    dl = requests.get(audio_url, timeout=cred.get("timeout") or TTS_HTTP_TIMEOUT)
+    if dl.status_code != 200:
+        raise RuntimeError("audio download HTTP %s" % dl.status_code)
+    return dl.content
+
+def _tts_call_with_deadline(text, cred):
+    """
+    Run one TTS attempt with a hard wall-clock limit.
+
+    A dead / invalid key can make the websocket path hang forever, which would
+    stall the whole failover chain. signal.alarm gives us a hard ceiling so a
+    bad credential is skipped quickly and the next one is tried.
+    """
+    limit = int(cred.get("timeout") or TTS_SDK_TIMEOUT)
+    if not hasattr(signal, "SIGALRM"):
+        # non-POSIX fallback: no deadline support
+        if cred["sdk"] == "v2":
+            return _tts_request_v2(text, cred)
+        elif cred["sdk"] == "http":
+            return _tts_request_http(text, cred)
+        return _tts_request_v1(text, cred)
+
+    def _on_alarm(signum, frame):
+        raise TimeoutError("TTS call exceeded %ss" % limit)
+
+    old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(limit)
+    try:
+        if cred["sdk"] == "v2":
+            return _tts_request_v2(text, cred)
+        elif cred["sdk"] == "http":
+            return _tts_request_http(text, cred)
+        return _tts_request_v1(text, cred)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
 def tts_request_with_failover(text, credentials=None):
     """
     Try each TTS credential in turn. Returns the wav path on success,
@@ -543,13 +653,10 @@ def tts_request_with_failover(text, credentials=None):
         masked = mask_api_key(cred["api_key"])
         print(f"Trying TTS credential [{idx}/{total}]: {masked}  "
               f"sdk={cred['sdk']} model={cred['model']} "
-              f"base_url={cred['base_url']}  ({cred['note']})")
+              f"base_url={cred['base_url']} voice={cred['voice'] or '-'}  ({cred['note']})")
         output_file = None
         try:
-            if cred["sdk"] == "v2":
-                audio = _tts_request_v2(text, cred)
-            else:
-                audio = _tts_request_v1(text, cred)
+            audio = _tts_call_with_deadline(text, cred)
             if audio:
                 output_file_path = './generated_story.wav'
                 with open(output_file_path, 'wb') as f:
