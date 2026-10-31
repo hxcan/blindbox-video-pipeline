@@ -17,7 +17,12 @@ MAX_FILE_SIZE_BYTES = int(MAX_FILE_SIZE_MIB * 1024 * 1024)
 
 
 # === Coding Plan 配置 ===
-CODING_PLAN_API_KEY = "sk-cp-hXp92UESDiNfV4qDT6ZL2iAbDIdbUOmbYZL8ZmoDDsnKwWl8U9NGnaHW5vDCeMiyRszsqc39c_wFULHHJBE5mmBH04M1MgO3J9gneSVXdNuWHz0Va9ER4H8"
+# 主用 API Key（主人提供，2026-07-23）
+CODING_PLAN_API_KEY = "sk-cp-2MIQ6WIKFj9sZmvWQxX7vv4PI8pZXzqrradj89cm4r1wh7ae7T14UcSZtzfyAaAa4qmb42SZNpUp38UoHu1keP6tlWbI6lYsL263iUJNuii1AtJ2XH10nXw"
+# 备用 API Key（限流时切换使用，2026-07-14 旧 key）
+BACKUP_API_KEYS = [
+    "sk-cp-hXp92UESDiNfV4qDT6ZL2iAbDIdbUOmbYZL8ZmoDDsnKwWl8U9NGnaHW5vDCeMiyRszsqc39c_wFULHHJBE5mmBH04M1MgO3J9gneSVXdNuWHz0Va9ER4H8",
+]
 CODING_PLAN_BASE_URL = "https://api.minimaxi.com/v1"
 CODING_PLAN_MODEL = "MiniMax-M3"
 # === 配置结束 ===
@@ -225,7 +230,7 @@ def send_request(media_path, prompt, api_key, media_type="video"):
     }
     
     headers = {
-        "Authorization": f"Bearer {CODING_PLAN_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
     
@@ -236,10 +241,15 @@ def send_request(media_path, prompt, api_key, media_type="video"):
         response = requests.post(url, headers=headers, json=payload, timeout=300)
         print(f"📨 HTTP 状态码：{response.status_code}")
         
+        if response.status_code == 429:
+            error_text = response.text
+            print(f"⚠️ 触发限流 (HTTP 429)：{error_text}")
+            return {"error": "RateLimit429", "status_code": 429, "message": error_text}
+
         if response.status_code != 200:
             error_text = response.text
             print(f"❌ 错误：{error_text}")
-            
+
             # 🆕 #823789924736 捕获通用 HTTP 500 错误（unknown error, 512 (1000) 等）
             if response.status_code == 500:
                 print(f"⚠️ 检测到 HTTP 500 错误（服务端错误），准备降级到截图模式")
@@ -314,6 +324,129 @@ def tts_request(text, api_key):
         return None
 
 
+# === TTS multi-credential failover (added 2026-10-31) ===
+# Previously speech synthesis relied on a single DASHSCOPE_API_KEY env var.
+# If that key expired / got disabled / ran out of quota, the whole pipeline
+# failed with no fallback. Now several credentials are supported and tried
+# one by one: the first one that succeeds wins, and only when all of them
+# fail does the script raise an error.
+# Credential sources, in priority order:
+#   1) config file tts_credentials.json (next to this script)
+#   2) env var TTS_API_KEYS (comma separated list of keys)
+#   3) env var DASHSCOPE_API_KEY (legacy single key support)
+# The config file accepts both a JSON array and plain text (one key per line).
+
+TTS_CREDENTIALS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tts_credentials.json"
+)
+
+
+def mask_api_key(api_key):
+    """Mask an API key for logging: keep first 8 and last 4 chars only."""
+    if not api_key:
+        return "(empty)"
+    if len(api_key) <= 12:
+        return api_key[:4] + "*" * 4
+    return api_key[:8] + "*" * 6 + api_key[-4:]
+
+
+def load_tts_credentials():
+    """
+    Load TTS credentials, returns [(api_key, note), ...]
+    Order: config file -> TTS_API_KEYS -> DASHSCOPE_API_KEY
+    """
+    credentials = []
+    seen = set()
+
+    def add_key(key, note):
+        key = (key or "").strip()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        credentials.append((key, note))
+
+    # 1) config file
+    try:
+        if os.path.exists(TTS_CREDENTIALS_FILE):
+            with open(TTS_CREDENTIALS_FILE, "r", encoding="utf-8") as f:
+                raw = f.read()
+            stripped = raw.strip()
+            if stripped.startswith("["):
+                # JSON array: [{"api_key": "sk-xxx", "note": "primary"}, ...]
+                try:
+                    items = json.loads(stripped)
+                except Exception as e:
+                    print(f"WARNING: failed to parse TTS credential JSON: {e}")
+                    items = []
+                for item in items:
+                    if isinstance(item, dict):
+                        add_key(item.get("api_key"), item.get("note") or "config file")
+                    elif isinstance(item, str):
+                        add_key(item, "config file")
+            else:
+                # plain text: one key per line ('#' starts a comment)
+                for line in raw.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    add_key(line, "config file")
+            print(f"Loaded TTS credentials from file: {TTS_CREDENTIALS_FILE}")
+    except Exception as e:
+        print(f"WARNING: failed to read TTS credential file: {e}")
+
+    # 2) TTS_API_KEYS env var (comma separated)
+    env_multi = os.environ.get("TTS_API_KEYS", "")
+    if env_multi.strip():
+        for key in env_multi.replace(chr(10), ",").split(","):
+            add_key(key, "env TTS_API_KEYS")
+
+    # 3) legacy single key env var
+    env_single = os.environ.get("DASHSCOPE_API_KEY", "")
+    if env_single.strip():
+        add_key(env_single, "env DASHSCOPE_API_KEY")
+
+    if credentials:
+        print(f"Available TTS credentials: {len(credentials)}")
+        for i, (key, note) in enumerate(credentials, 1):
+            print(f"   [{i}] {mask_api_key(key)}  ({note})")
+    return credentials
+
+
+def tts_request_with_failover(text, credentials=None):
+    """
+    Try each TTS credential in turn. Returns the wav path on success,
+    or None when every credential failed.
+    """
+    if credentials is None:
+        credentials = load_tts_credentials()
+    if not credentials:
+        print("ERROR: no TTS credential available")
+        print("   Configure tts_credentials.json, or set DASHSCOPE_API_KEY / TTS_API_KEYS")
+        return None
+
+    failures = []
+    total = len(credentials)
+    for idx, (api_key, note) in enumerate(credentials, 1):
+        print(f"Trying TTS credential [{idx}/{total}]: {mask_api_key(api_key)}  ({note})")
+        output_file = None
+        try:
+            output_file = tts_request(text, api_key)
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+            print(f"Credential [{idx}/{total}] raised an exception: {reason}")
+        if output_file:
+            print(f"SUCCESS: TTS credential [{idx}/{total}] worked: {mask_api_key(api_key)}")
+            return output_file
+        reason = "no audio data returned"
+        failures.append((idx, mask_api_key(api_key), note, reason))
+        print(f"Credential [{idx}/{total}] failed: {reason}, trying next...")
+
+    print("ERROR: all TTS credentials failed")
+    for idx, masked, note, reason in failures:
+        print(f"   [{idx}] {masked} ({note}) -> {reason}")
+    return None
+# === end of TTS multi-credential failover ===
+
 def save_story_to_file(text):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f'generated_story_{timestamp}.txt'
@@ -334,16 +467,109 @@ def load_face_templates():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: script.py <video.mp4> <app_name>")
+    # 🆕 解析可选参数 --image / -i：直接以图片模式运行，跳过视频处理与裁切
+    image_mode = False
+    filtered_argv = []
+    for arg in sys.argv[1:]:
+        if arg in ("--image", "-i"):
+            image_mode = True
+        else:
+            filtered_argv.append(arg)
+    if len(filtered_argv) < 2:
+        print("Usage: script.py <video.mp4|image> <app_name> [--image|-i]")
         sys.exit(1)
     
-    video_path = sys.argv[1]
-    app_name = sys.argv[2]
+    video_path = filtered_argv[0]
+    app_name = filtered_argv[1]
     
     api_key = CODING_PLAN_API_KEY
     print(f"💡 使用 Coding Plan API Key: {api_key[:10]}...")
     print(f"🔗 使用接入点：{CODING_PLAN_BASE_URL}")
+    
+    # 🆕 图片模式：跳过视频处理与所有视频错误检测，直接进入图片生成流程
+    if image_mode:
+        if not os.path.exists(video_path):
+            print(f"❌ 图片文件不存在：{video_path}")
+            sys.exit(1)
+        print(f"🖼️ 直接图片模式：{video_path}")
+        prompt = construct_prompt(app_name, media_type="截屏图片")
+        keys_to_try = [CODING_PLAN_API_KEY] + BACKUP_API_KEYS
+        result = None
+        for attempt, current_key in enumerate(keys_to_try, 1):
+            print(f"\n🔑 尝试 API key {attempt}/{len(keys_to_try)}: {current_key[:10]}...")
+            result = send_request(video_path, prompt, current_key, media_type="image")
+            if result and isinstance(result, dict) and result.get("error") == "RateLimit429":
+                print(f"⚠️ API key {attempt} 触发限流，尝试下一个 key...")
+                result = None
+                continue
+            break
+        if result is None:
+            print("❌ 所有 API key 都不可用")
+            sys.exit(1)
+        if result and isinstance(result, dict) and result.get("error"):
+            print(f"❌ 图片生成失败 (错误：{result.get('error')})，无法生成小说")
+            sys.exit(1)
+        # 直接复用现有"生成成功后写文件"的代码块
+        if result and 'choices' in result and len(result['choices']) > 0:
+            # === 直接图片模式专用：读 output_info.json 用作 title / 后续写回 ===
+            output_info_path = 'output_info.json'
+            try:
+                with open(output_info_path, 'r', encoding='utf-8') as f:
+                    output_info = json.load(f)
+            except FileNotFoundError:
+                print(f"⚠️ {output_info_path} 不存在，使用空配置")
+                output_info = {}
+            except json.JSONDecodeError as e:
+                print(f"⚠️ 解析 {output_info_path} 失败：{e}")
+                output_info = {}
+            
+            generated_text = result['choices'][0]['message']['content']
+            import re
+            generated_text = re.sub(r'<think>.*?</think>', '', generated_text, flags=re.DOTALL)
+            generated_text = generated_text.strip()
+            generated_text = generated_text + ' '
+            print("Generated Sci-fi Story:")
+            print(generated_text)
+            save_story_to_file(generated_text)
+            
+            video_title = output_info.get("title", "").strip()
+            if not video_title:
+                print("Warning: 'title' is missing or empty in output_info.json")
+                video_title = "Untitled"
+            
+            description = f"{video_title} {generated_text}".strip()
+            print("\n=== Final Description (Copy for platforms) ===")
+            print(description)
+            print("==============================================")
+            
+            output_info["description"] = description
+            try:
+                with open(output_info_path, 'w', encoding='utf-8') as f:
+                    json.dump(output_info, f, ensure_ascii=False, indent=4)
+                print(f"SUCCESS: Description 已追加到 {output_info_path}")
+            except Exception as e:
+                print(f"Error writing to {output_info_path}: {e}")
+            
+            tts_credentials = load_tts_credentials()
+            if not tts_credentials:
+                print("ERROR: no TTS credential found, cannot run speech synthesis")
+                sys.exit(1)
+            output_file = tts_request_with_failover(generated_text, tts_credentials)
+            if output_file:
+                    print(f"语音文件已保存至：{output_file}")
+                    current_script_path = os.path.abspath(__file__)
+                    script_dir = os.path.dirname(current_script_path)
+                    second_script_path = os.path.join(script_dir, '..', 'ruby.he', 'generate.face.video.p4.rb')
+                    candidate_images = load_face_templates()
+                    selected_image = random.choice(candidate_images)
+                    video_template_path = os.path.join(script_dir, '..', 'material.ache', 'image.e', selected_image)
+                    second_script_path = os.path.abspath(second_script_path)
+                    video_template_path = os.path.abspath(video_template_path)
+                    subprocess.call(['ruby', second_script_path, output_file, video_template_path])
+        else:
+            print("❌ 图片生成结果为空")
+            sys.exit(1)
+        sys.exit(0)
     
     processed_video_path, was_trimmed, trim_success = check_and_trim_video(video_path)
     
@@ -355,7 +581,21 @@ if __name__ == "__main__":
         print(f"📹 使用处理后的视频：{processed_video_path}")
     
     prompt = construct_prompt(app_name, media_type="视频")
-    result = send_request(processed_video_path, prompt, api_key, media_type="video")
+    # 🆕 #848622252536 遇到 429 限流时自动切换备用 API key 重试
+    keys_to_try = [CODING_PLAN_API_KEY] + BACKUP_API_KEYS
+    result = None
+    for attempt, current_key in enumerate(keys_to_try, 1):
+        print(f"\n🔑 尝试 API key {attempt}/{len(keys_to_try)}: {current_key[:10]}...")
+        result = send_request(processed_video_path, prompt, current_key, media_type="video")
+        if result and isinstance(result, dict) and result.get("error") == "RateLimit429":
+            print(f"⚠️ API key {attempt} 触发限流，尝试下一个 key...")
+            result = None
+            continue
+        # 成功获取结果或非限流错误（如 DataInspectionFailed）跳出循环
+        break
+    if result is None:
+        print("❌ 所有 API key 都不可用")
+        sys.exit(1)
     
     if was_trimmed and processed_video_path:
         cleanup_temp_file(processed_video_path)
@@ -385,7 +625,16 @@ if __name__ == "__main__":
         
         if use_screenshot:
             prompt = construct_prompt(app_name, media_type="截屏图片")
-            result = send_request(screenshot_path, prompt, api_key, media_type="image")
+            # 🆕 #848622252536 截图模式也尝试多个 key
+            for attempt, current_key in enumerate(keys_to_try, 1):
+                result = send_request(screenshot_path, prompt, current_key, media_type="image")
+                if result and isinstance(result, dict) and result.get("error") == "RateLimit429":
+                    print(f"⚠️ 截图模式 key {attempt} 触发限流，尝试下一个...")
+                    result = None
+                    continue
+                break
+            if result is None:
+                print("❌ 截图模式所有 API key 都不可用")
         else:
             print("❌ 无法回退到截屏图片方式，生成失败")
             sys.exit(1)
@@ -436,17 +685,15 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Error writing to {output_info_path}: {e}")
         
-        # 语音合成使用环境变量中的按量付费 API Key，而非 Coding Plan Key
-        tts_api_key = os.environ.get("DASHSCOPE_API_KEY")
-        if not tts_api_key:
-            print("❌ 错误：请设置 DASHSCOPE_API_KEY 环境变量后再运行")
-            print("   export DASHSCOPE_API_KEY='sk-xxxxxxxx'")
+        # Speech synthesis uses pay-per-use API keys (not Coding Plan keys).
+        # Multiple credentials are tried one by one until one succeeds.
+        tts_credentials = load_tts_credentials()
+        if not tts_credentials:
+            print("ERROR: no TTS credential found, cannot run speech synthesis")
             import sys
             sys.exit(1)
-        else:
-            print(f"🎤 使用环境变量 API Key 进行语音合成：{tts_api_key[:10]}...")
-            output_file = tts_request(generated_text, tts_api_key)
-            if output_file:
+        output_file = tts_request_with_failover(generated_text, tts_credentials)
+        if output_file:
                 print(f"语音文件已保存至：{output_file}")
                 current_script_path = os.path.abspath(__file__)
                 script_dir = os.path.dirname(current_script_path)
