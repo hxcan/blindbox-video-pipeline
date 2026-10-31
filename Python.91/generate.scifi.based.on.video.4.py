@@ -306,39 +306,58 @@ def send_request(media_path, prompt, api_key, media_type="video"):
 # === 修改结束 ===
 
 
-def tts_request(text, api_key):
-    dashscope.api_key = api_key
-    result = SpeechSynthesizer.call(
-        model='sambert-zhiting-v1',
-        text=text,
-        sample_rate=16000
-    )
-    if result.get_audio_data() is not None:
-        output_file_path = './generated_story.wav'
-        with open(output_file_path, 'wb') as f:
-            f.write(result.get_audio_data())
-        print(f'SUCCESS: get audio data in {output_file_path}')
-        return output_file_path
-    else:
-        print('ERROR: response is %s' % (result.get_response()))
-        return None
+# === TTS multi-credential failover with per-credential base_url (2026-10-31) ===
+# Speech synthesis used to rely on a single DASHSCOPE_API_KEY env var. If that
+# key expired / got disabled / ran out of quota, the whole pipeline failed with
+# no fallback. Now several credentials are supported and tried one by one:
+# the first one that succeeds wins, and only when all of them fail does the
+# script raise an error.
+#
+# Credentials live in ~/.blindbox/aliyun.nces/tts.art.json (JSON array).
+# Every entry may carry its own base_url / model / voice, because different
+# Aliyun (Bailian) API keys can point at different endpoints.
+#
+# Entry format:
+#   {
+#     "api_key": "sk-xxxx...",
+#     "base_url": "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
+#     "model": "sambert-zhiting-v1",
+#     "voice": "longxiaochun",
+#     "sample_rate": 16000,
+#     "note": "human readable label"
+#   }
+# All fields except api_key are optional; defaults are used when missing.
+#
+# Two SDK classes are supported, chosen automatically by the "sdk" field:
+#   "v1" -> dashscope.audio.tts.SpeechSynthesizer      (old, sambert-*)
+#   "v2" -> dashscope.audio.tts_v2.SpeechSynthesizer   (new, qwen-tts / cosyvoice)
+# When "sdk" is absent it is inferred: model starting with "qwen-tts" or
+# containing "cosyvoice" uses v2, everything else uses v1.
 
+import json as _json
 
-# === TTS multi-credential failover (added 2026-10-31) ===
-# Previously speech synthesis relied on a single DASHSCOPE_API_KEY env var.
-# If that key expired / got disabled / ran out of quota, the whole pipeline
-# failed with no fallback. Now several credentials are supported and tried
-# one by one: the first one that succeeds wins, and only when all of them
-# fail does the script raise an error.
-# Credential sources, in priority order:
-#   1) config file tts_credentials.json (next to this script)
-#   2) env var TTS_API_KEYS (comma separated list of keys)
-#   3) env var DASHSCOPE_API_KEY (legacy single key support)
-# The config file accepts both a JSON array and plain text (one key per line).
-
+# --- TTS credential config file ---
+# Located in a hidden directory under the home directory, shared by all scripts.
 TTS_CREDENTIALS_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "tts_credentials.json"
+    os.path.expanduser("~"), ".blindbox", "aliyun.nces", "tts.art.json"
 )
+
+# --- defaults used when a credential entry omits a field ---
+TTS_DEFAULT_BASE_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+TTS_DEFAULT_MODEL_V1 = "sambert-zhiting-v1"
+TTS_DEFAULT_MODEL_V2 = "qwen-tts"
+TTS_DEFAULT_VOICE_V2 = "longxiaochun"
+TTS_DEFAULT_SAMPLE_RATE = 16000
+
+# --- optional import of the v2 (new generation) speech synthesizer ---
+try:
+    from dashscope.audio.tts_v2 import SpeechSynthesizer as SpeechSynthesizerV2
+    from dashscope.audio.tts_v2 import AudioFormat as AudioFormatV2
+    _HAS_TTS_V2 = True
+except Exception:
+    SpeechSynthesizerV2 = None
+    AudioFormatV2 = None
+    _HAS_TTS_V2 = False
 
 
 def mask_api_key(api_key):
@@ -350,20 +369,71 @@ def mask_api_key(api_key):
     return api_key[:8] + "*" * 6 + api_key[-4:]
 
 
+def _normalize_tts_entry(entry):
+    """Turn one config entry into a normalized dict, or None if unusable."""
+    if isinstance(entry, str):
+        entry = {"api_key": entry}
+    if not isinstance(entry, dict):
+        return None
+    api_key = (entry.get("api_key") or entry.get("key") or "").strip()
+    if not api_key:
+        return None
+
+    model = (entry.get("model") or "").strip()
+    sdk = (entry.get("sdk") or "").strip().lower()
+    if not sdk:
+        low = model.lower()
+        if low.startswith("qwen-tts") or "cosyvoice" in low:
+            sdk = "v2"
+        else:
+            sdk = "v1"
+
+    base_url = (entry.get("base_url") or entry.get("url") or "").strip()
+    if not base_url:
+        base_url = TTS_DEFAULT_BASE_URL
+
+    voice = (entry.get("voice") or "").strip()
+    if not voice and sdk == "v2":
+        voice = TTS_DEFAULT_VOICE_V2
+
+    try:
+        sample_rate = int(entry.get("sample_rate") or TTS_DEFAULT_SAMPLE_RATE)
+    except (TypeError, ValueError):
+        sample_rate = TTS_DEFAULT_SAMPLE_RATE
+
+    if not model:
+        model = TTS_DEFAULT_MODEL_V2 if sdk == "v2" else TTS_DEFAULT_MODEL_V1
+
+    return {
+        "api_key": api_key,
+        "base_url": base_url,
+        "model": model,
+        "voice": voice,
+        "sample_rate": sample_rate,
+        "sdk": sdk,
+        "note": (entry.get("note") or "").strip() or "config file",
+    }
+
+
 def load_tts_credentials():
     """
-    Load TTS credentials, returns [(api_key, note), ...]
-    Order: config file -> TTS_API_KEYS -> DASHSCOPE_API_KEY
+    Load TTS credentials from ~/.blindbox/aliyun.nces/tts.art.json.
+    Returns a list of normalized dicts. Falls back to the legacy
+    DASHSCOPE_API_KEY env var when the config file is absent or empty.
     """
     credentials = []
     seen = set()
 
-    def add_key(key, note):
-        key = (key or "").strip()
-        if not key or key in seen:
+    def add_entry(entry):
+        norm = _normalize_tts_entry(entry)
+        if not norm:
             return
-        seen.add(key)
-        credentials.append((key, note))
+        # de-duplicate on (api_key, base_url, model, voice)
+        sig = (norm["api_key"], norm["base_url"], norm["model"], norm["voice"])
+        if sig in seen:
+            return
+        seen.add(sig)
+        credentials.append(norm)
 
     # 1) config file
     try:
@@ -371,45 +441,87 @@ def load_tts_credentials():
             with open(TTS_CREDENTIALS_FILE, "r", encoding="utf-8") as f:
                 raw = f.read()
             stripped = raw.strip()
-            if stripped.startswith("["):
-                # JSON array: [{"api_key": "sk-xxx", "note": "primary"}, ...]
+            parsed = None
+            if stripped.startswith("[") or stripped.startswith("{"):
+                # whole-file JSON (array of entries, or a single entry)
                 try:
-                    items = json.loads(stripped)
-                except Exception as e:
-                    print(f"WARNING: failed to parse TTS credential JSON: {e}")
-                    items = []
-                for item in items:
-                    if isinstance(item, dict):
-                        add_key(item.get("api_key"), item.get("note") or "config file")
-                    elif isinstance(item, str):
-                        add_key(item, "config file")
+                    parsed = _json.loads(stripped)
+                except Exception:
+                    # maybe several JSON objects, one per line -> handled below
+                    parsed = None
+            if parsed is not None:
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        add_entry(item)
+                else:
+                    add_entry(parsed)
             else:
-                # plain text: one key per line ('#' starts a comment)
+                # line based: one JSON object per line, or one bare key per line
                 for line in raw.splitlines():
                     line = line.strip()
                     if not line or line.startswith("#"):
                         continue
-                    add_key(line, "config file")
+                    if line.startswith("{"):
+                        try:
+                            add_entry(_json.loads(line))
+                        except Exception as e:
+                            print(f"WARNING: failed to parse TTS credential JSON line: {e}")
+                    else:
+                        add_entry({"api_key": line})
             print(f"Loaded TTS credentials from file: {TTS_CREDENTIALS_FILE}")
+        else:
+            print(f"TTS credential file not found: {TTS_CREDENTIALS_FILE}")
     except Exception as e:
         print(f"WARNING: failed to read TTS credential file: {e}")
 
-    # 2) TTS_API_KEYS env var (comma separated)
-    env_multi = os.environ.get("TTS_API_KEYS", "")
-    if env_multi.strip():
-        for key in env_multi.replace(chr(10), ",").split(","):
-            add_key(key, "env TTS_API_KEYS")
-
-    # 3) legacy single key env var
+    # 2) legacy single key env var (kept for backward compatibility)
     env_single = os.environ.get("DASHSCOPE_API_KEY", "")
     if env_single.strip():
-        add_key(env_single, "env DASHSCOPE_API_KEY")
+        add_entry({"api_key": env_single, "note": "env DASHSCOPE_API_KEY"})
 
     if credentials:
         print(f"Available TTS credentials: {len(credentials)}")
-        for i, (key, note) in enumerate(credentials, 1):
-            print(f"   [{i}] {mask_api_key(key)}  ({note})")
+        for i, c in enumerate(credentials, 1):
+            print(f"   [{i}] {mask_api_key(c['api_key'])}  sdk={c['sdk']} "
+                  f"model={c['model']} voice={c['voice'] or '-'} "
+                  f"base_url={c['base_url']}  ({c['note']})")
     return credentials
+
+
+def _tts_request_v1(text, cred):
+    """Old SDK path: dashscope.audio.tts.SpeechSynthesizer (sambert-*)."""
+    dashscope.api_key = cred["api_key"]
+    kwargs = {
+        "model": cred["model"],
+        "text": text,
+        "sample_rate": cred["sample_rate"],
+    }
+    # base_address overrides the websocket endpoint for this call only
+    if cred.get("base_url"):
+        kwargs["base_address"] = cred["base_url"]
+    result = SpeechSynthesizer.call(**kwargs)
+    audio = result.get_audio_data()
+    if audio is not None:
+        return audio
+    print('ERROR: response is %s' % (result.get_response()))
+    return None
+
+
+def _tts_request_v2(text, cred):
+    """New SDK path: dashscope.audio.tts_v2.SpeechSynthesizer (qwen-tts)."""
+    if not _HAS_TTS_V2:
+        raise RuntimeError(
+            "dashscope.audio.tts_v2 is not available in this environment; "
+            "install/upgrade the dashscope SDK to use qwen-tts models")
+    dashscope.api_key = cred["api_key"]
+    synthesizer = SpeechSynthesizerV2(
+        model=cred["model"],
+        voice=cred["voice"],
+        format=AudioFormatV2.WAV_16000HZ_MONO_16BIT,
+        url=cred.get("base_url") or None,
+    )
+    audio = synthesizer.call(text)
+    return audio
 
 
 def tts_request_with_failover(text, credentials=None):
@@ -421,29 +533,46 @@ def tts_request_with_failover(text, credentials=None):
         credentials = load_tts_credentials()
     if not credentials:
         print("ERROR: no TTS credential available")
-        print("   Configure tts_credentials.json, or set DASHSCOPE_API_KEY / TTS_API_KEYS")
+        print(f"   Configure {TTS_CREDENTIALS_FILE}, "
+              "or set the DASHSCOPE_API_KEY env var")
         return None
 
     failures = []
     total = len(credentials)
-    for idx, (api_key, note) in enumerate(credentials, 1):
-        print(f"Trying TTS credential [{idx}/{total}]: {mask_api_key(api_key)}  ({note})")
+    for idx, cred in enumerate(credentials, 1):
+        masked = mask_api_key(cred["api_key"])
+        print(f"Trying TTS credential [{idx}/{total}]: {masked}  "
+              f"sdk={cred['sdk']} model={cred['model']} "
+              f"base_url={cred['base_url']}  ({cred['note']})")
         output_file = None
         try:
-            output_file = tts_request(text, api_key)
+            if cred["sdk"] == "v2":
+                audio = _tts_request_v2(text, cred)
+            else:
+                audio = _tts_request_v1(text, cred)
+            if audio:
+                output_file_path = './generated_story.wav'
+                with open(output_file_path, 'wb') as f:
+                    f.write(audio)
+                print(f'SUCCESS: get audio data in {output_file_path}')
+                output_file = output_file_path
         except Exception as e:
             reason = f"{type(e).__name__}: {e}"
             print(f"Credential [{idx}/{total}] raised an exception: {reason}")
+            failures.append((idx, masked, cred, reason))
+            print(f"Credential [{idx}/{total}] failed, trying next...")
+            continue
         if output_file:
-            print(f"SUCCESS: TTS credential [{idx}/{total}] worked: {mask_api_key(api_key)}")
+            print(f"SUCCESS: TTS credential [{idx}/{total}] worked: {masked}")
             return output_file
         reason = "no audio data returned"
-        failures.append((idx, mask_api_key(api_key), note, reason))
+        failures.append((idx, masked, cred, reason))
         print(f"Credential [{idx}/{total}] failed: {reason}, trying next...")
 
     print("ERROR: all TTS credentials failed")
-    for idx, masked, note, reason in failures:
-        print(f"   [{idx}] {masked} ({note}) -> {reason}")
+    for idx, masked, cred, reason in failures:
+        print(f"   [{idx}] {masked} sdk={cred['sdk']} model={cred['model']} "
+              f"({cred['note']}) -> {reason}")
     return None
 # === end of TTS multi-credential failover ===
 
